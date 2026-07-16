@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "docx-renderer": {
+      "type": "stdio",
+      "command": "python",
+      "args": [],
+      "env": {}
+    }
+  }
+}

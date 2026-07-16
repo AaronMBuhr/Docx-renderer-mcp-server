@@ -1,0 +1,27 @@
+# Node dependencies — restore with: cd node-renderer-runtime && npm ci
+node-renderer-runtime/node_modules/
+
+# Render workspaces: each holds a generated docx document program, which embeds
+# the document's full content. Failed renders are kept on disk for diagnosis
+# (keep_failed_workspaces), so these are working artifacts, never source.
+node-renderer-runtime/workspaces/
+python-renderer-runtime/workspaces/*
+!python-renderer-runtime/workspaces/.gitkeep
+
+# Rendered output documents
+generated-docx/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local env and secrets
+.env
+
+# Live config — machine-specific paths. Copy docx-renderer-server.yaml.example
+# to docx-renderer-server.yaml and point directory_aliases at your own dirs.
+docx-renderer-server.yaml
+
+# Local agent config (machine-specific)
+.claude/

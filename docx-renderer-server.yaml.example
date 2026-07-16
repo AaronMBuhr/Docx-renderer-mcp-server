@@ -1,0 +1,16 @@
+defaults:
+  output_root: generated-docx
+  node_runtime_root: node-renderer-runtime
+  python_runtime_root: python-renderer-runtime
+  allowed_renderer_types:
+    - node
+  timeout_seconds: 30
+  max_timeout_seconds: 120
+
+# Directory aliases for server-side file transport. Each alias names exactly one
+# directory. A render_docx file entry may use
+# {path, source_path: 'alias/relative/path'}; the server resolves it against that
+# directory and reads the docx document program itself. Empty/absent disables it
+# (fail closed).
+directory_aliases:
+  job_applications: C:\path\to\your\documents
