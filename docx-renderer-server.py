@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 from datetime import datetime
+import difflib
 from dotenv import load_dotenv
 import json
 import logging
@@ -146,6 +147,17 @@ ALLOWED_PROCESS_ENV_VARS = frozenset({
 ALLOWED_PYTHON_ENV_VARS = frozenset({
     "OUTPUT_DOCX_PATH", "DOCX_RENDER_WORKSPACE", "DOCX_RENDER_METADATA_PATH",
 })
+
+# Known hallucinated docx (npm) symbols mapped to the real export that is a
+# safe drop-in replacement. Applied as a whole-identifier rewrite on the node
+# program (import statement AND usages) before the policy scan and execution.
+# Deliberately tiny and curated: only add a 1:1 rename where the wrong and
+# right symbols share the same shape -- e.g. TabStopLeader.NONE and
+# LeaderType.NONE are both enum members with identical values. Anything not in
+# this map that does not exist in docx is rejected, never guessed.
+DOCX_IMPORT_ALIASES: Dict[str, str] = {
+    "TabStopLeader": "LeaderType",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -719,6 +731,164 @@ def validate_python_script_policy(files: list[Dict[str, str]]) -> list[Dict[str,
             ))
 
     return errors
+
+
+# ---------------------------------------------------------------------------
+# docx document-program envelope + import handling
+# ---------------------------------------------------------------------------
+
+_ENV_FENCE_OPEN = re.compile(r"^```[A-Za-z0-9_-]*\s*\n")
+_ENV_FENCE_CLOSE = re.compile(r"\n```\s*$")
+_DOCX_PROGRAM_REQUIRED = ("renderer_type", "source_filename", "source_code")
+_DOCX_IMPORT_BLOCK = re.compile(r"import\s*\{([^}]*)\}\s*from\s*['\"]docx['\"]")
+
+
+def _strip_one_fence(text: str) -> str:
+    """Strip exactly one wrapping markdown code fence, if present."""
+    s = text.strip()
+    m = _ENV_FENCE_OPEN.match(s)
+    if m and _ENV_FENCE_CLOSE.search(s):
+        return _ENV_FENCE_CLOSE.sub("", s[m.end():]).strip()
+    return s
+
+
+def analyze_entrypoint_content(content: str) -> Dict[str, Any]:
+    """Classify the entrypoint content: runnable program, docx document-program
+    JSON envelope, or a broken in-between.
+
+    Envelope detection tolerates trailing junk after the object: raw_decode
+    parses exactly one balanced object, and a complete object is proof the
+    envelope was not truncated, so anything after it is discarded. That is where
+    the "grab the object, ignore the rest" tolerance lives -- but only the
+    *trailing* axis; a body that does not parse to an envelope is 'broken', not
+    silently treated as a program.
+
+    Returns one of:
+      {"kind": "program"}
+      {"kind": "envelope", "source_code": str, "renderer_type": str|None,
+       "trailing": str}
+      {"kind": "broken", "detail": str}
+    """
+    stripped = _strip_one_fence(content).lstrip()
+    if not stripped.startswith("{"):
+        return {"kind": "program"}
+    try:
+        obj, end = json.JSONDecoder().raw_decode(stripped)
+    except json.JSONDecodeError as exc:
+        return {"kind": "broken",
+                "detail": f"content begins with '{{' but is not parseable JSON ({exc})"}
+    if not isinstance(obj, dict):
+        return {"kind": "broken", "detail": "content is a JSON value but not an object"}
+    missing = [k for k in _DOCX_PROGRAM_REQUIRED if k not in obj]
+    if missing:
+        return {"kind": "broken",
+                "detail": "JSON object is not a docx document-program envelope "
+                          f"(missing {', '.join(missing)})"}
+    source_code = obj.get("source_code")
+    if not isinstance(source_code, str) or not source_code.strip():
+        return {"kind": "broken",
+                "detail": "envelope 'source_code' is empty or not a string"}
+    return {"kind": "envelope", "source_code": source_code,
+            "renderer_type": obj.get("renderer_type"),
+            "trailing": stripped[end:].strip()}
+
+
+_DOCX_EXPORTS_CACHE: Optional[set] = None
+
+
+def get_docx_exports(settings: "ServerSettings") -> Optional[set]:
+    """Enumerate the docx npm package's named exports once, cached.
+
+    Returns the set of export names, or None if it could not be determined -- in
+    which case import existence-validation is skipped (fail open: never block a
+    render just because the probe failed; known-alias repair still runs).
+    """
+    global _DOCX_EXPORTS_CACHE
+    if _DOCX_EXPORTS_CACHE is not None:
+        return _DOCX_EXPORTS_CACHE
+    node_exe = shutil.which(settings.node_executable) or shutil.which("node")
+    if not node_exe:
+        return None
+    runtime_root = (PROJECT_ROOT / settings.node_runtime_root).resolve()
+    try:
+        proc = subprocess.run(
+            [node_exe, "--input-type=module", "-e",
+             "import('docx').then(m=>process.stdout.write("
+             "JSON.stringify(Object.keys(m))))"],
+            cwd=str(runtime_root),
+            capture_output=True, text=True, timeout=15, shell=False,
+        )
+    except Exception:
+        return None
+    out = (proc.stdout or "").strip()
+    if proc.returncode != 0 or not out.startswith("["):
+        return None
+    try:
+        names = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(names, list):
+        _DOCX_EXPORTS_CACHE = {str(n) for n in names}
+        return _DOCX_EXPORTS_CACHE
+    return None
+
+
+def _docx_imported_names(source: str) -> list:
+    """All named specifiers imported from the 'docx' package (the name to the
+    left of any 'as' alias), in source order, de-duplicated."""
+    seen: list = []
+    for block in _DOCX_IMPORT_BLOCK.findall(source):
+        for spec in block.split(","):
+            name = re.split(r"\s+as\s+", spec.strip(), maxsplit=1)[0].strip()
+            if name and name not in seen:
+                seen.append(name)
+    return seen
+
+
+def repair_and_validate_docx_imports(
+    source: str, exports: Optional[set],
+) -> Dict[str, Any]:
+    """Auto-repair known-alias docx imports and reject unknown ones.
+
+    - Any imported docx symbol in DOCX_IMPORT_ALIASES whose replacement is a
+      real export is rewritten wherever it appears (import and usages) as a
+      whole-identifier substitution, and reported as a warning.
+    - After repair, any imported docx symbol that is still not a real export is
+      rejected with a nearest-match suggestion.
+    - When 'exports' is None the existence check is skipped (fail open); known
+      aliases are still repaired.
+
+    Returns {"source_code": str, "warnings": [str, ...]} on success, or
+    {"error": <structured error dict>} if an unknown symbol survives.
+    """
+    warnings: list = []
+    for bad in _docx_imported_names(source):
+        good = DOCX_IMPORT_ALIASES.get(bad)
+        if not good:
+            continue
+        if exports is not None and good not in exports:
+            continue  # our own map is stale; let the unknown check report it
+        source = re.sub(rf"\b{re.escape(bad)}\b", good, source)
+        warnings.append(
+            f"auto-repaired docx import '{bad}' -> '{good}' "
+            f"(docx does not export '{bad}')"
+        )
+
+    if exports is not None:
+        unknown = [n for n in _docx_imported_names(source) if n not in exports]
+        if unknown:
+            details = []
+            for n in unknown:
+                near = difflib.get_close_matches(n, list(exports), n=1)
+                hint = f" (did you mean '{near[0]}'?)" if near else ""
+                details.append(f"'{n}'{hint}")
+            return {"error": _render_error(
+                "DOCX_IMPORT_NOT_EXPORTED",
+                "Renderer imports docx symbol(s) the installed docx package "
+                "does not export: " + ", ".join(details) + ".",
+            )}
+
+    return {"source_code": source, "warnings": warnings}
 
 
 # ---------------------------------------------------------------------------
@@ -1480,6 +1650,77 @@ def _do_render(
             "INVALID_FILE_PATH",
             f"Entrypoint '{entrypoint}' is not among the supplied files",
         )])
+
+    # 5b. node: extract a docx document-program JSON envelope in-process, then
+    #     repair/validate the program's docx imports before it is executed.
+    #
+    #     The entrypoint may arrive either as a runnable module OR as the raw
+    #     JSON envelope the AI server returned ({renderer_type, source_filename,
+    #     source_code}). Extracting source_code here -- rather than having the
+    #     caller hand-write an intermediate .mjs -- removes the empty-file
+    #     handoff race and tolerates trailing junk a strict JSON contract would
+    #     reject. Two independent signals decide envelope-vs-module: the source
+    #     file's extension and the content shape. They must agree; a mismatch is
+    #     a hard error, because it means an upstream step misfired.
+    if renderer_type == "node":
+        ep_path = entrypoint.replace("\\", "/")
+        ep_entry = next(
+            (e for e in files if e.get("path", "").replace("\\", "/") == ep_path),
+            None,
+        )
+        if ep_entry is not None:
+            src_ext = os.path.splitext(
+                str(file_sources.get(ep_entry["path"], "")))[1].lower()
+            info = analyze_entrypoint_content(ep_entry.get("content", ""))
+            kind = info["kind"]
+
+            if kind == "broken":
+                return fail("invalid_request", [_render_error(
+                    "DOCX_PROGRAM_MALFORMED",
+                    f"Entrypoint '{entrypoint}' is neither a runnable module nor "
+                    f"a usable docx document-program envelope: {info['detail']}.",
+                )])
+            if src_ext == ".json" and kind == "program":
+                return fail("invalid_request", [_render_error(
+                    "DOCX_PROGRAM_TYPE_MISMATCH",
+                    "Entrypoint source file is '.json' but its content is a "
+                    "renderer module, not a docx document-program envelope. "
+                    "Signals disagree; refusing to guess.",
+                )])
+            if src_ext in (".mjs", ".js") and kind == "envelope":
+                return fail("invalid_request", [_render_error(
+                    "DOCX_PROGRAM_TYPE_MISMATCH",
+                    f"Entrypoint source file is '{src_ext}' but its content is a "
+                    "docx document-program JSON envelope (was envelope extraction "
+                    "skipped upstream?). Signals disagree; refusing to guess.",
+                )])
+            if kind == "envelope":
+                ep_entry["content"] = info["source_code"]
+                all_warnings.append(
+                    "Extracted docx document program from JSON envelope "
+                    f"({len(info['source_code'])} chars of source_code); the "
+                    "envelope wrapper was not executed."
+                )
+                if info["trailing"]:
+                    all_warnings.append(
+                        f"Discarded {len(info['trailing'])} character(s) of "
+                        "trailing content after the envelope object; used the "
+                        "first complete object. Verify the rendered .docx."
+                    )
+
+        # repair known-alias docx imports and reject unknown ones, on every node
+        # code file, before the policy scan sees the final JavaScript.
+        docx_exports = get_docx_exports(settings)
+        for entry in files:
+            if os.path.splitext(
+                    entry.get("path", ""))[1].lower() not in (".mjs", ".js"):
+                continue
+            rep = repair_and_validate_docx_imports(
+                entry.get("content", ""), docx_exports)
+            if "error" in rep:
+                return fail("rejected_by_policy", [rep["error"]])
+            entry["content"] = rep["source_code"]
+            all_warnings.extend(rep["warnings"])
 
     # 6. validate script safety (renderer-specific scanner)
     if renderer_type == "node":
