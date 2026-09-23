@@ -108,19 +108,44 @@ BLOCKED_PYTHON_MODULES = frozenset({
     "ctypes",
 })
 
+# Node/JS patterns rejected before execution. Two shapes here, and the
+# difference between them is load-bearing.
+#
+# Call patterns use `(?<![.\w])` instead of `\b` so they match a bare global
+# call but not a method call on an object. `\b` sits in the gap between `.` and
+# an identifier, so `\bexec\s*\(` matched `regex.exec(text)` -- the idiomatic
+# way to walk repeated matches, and precisely what a markdown-to-docx program
+# writes to parse `**bold**`. Excluding the method form costs nothing:
+# `exec`/`execFile`/`spawn`/`fork` reach a program only through
+# `child_process`, which BLOCKED_NODE_MODULES rejects; `require()` is rejected
+# outright; and dynamic `import()` is blocked. A program that clears the import
+# checks has no such symbol to call, so a bare `exec(` would be a ReferenceError
+# rather than a breach. `eval` and `fetch` genuinely are globals, and their bare
+# form is still caught -- as is the same global reached through a global-object
+# qualifier (`globalThis.fetch(`, `window.eval(`), which the method-call
+# exclusion would otherwise wave through. Other qualifiers (`client.fetch(`)
+# are ordinary methods and stay allowed.
+#
+# Construction patterns require `new ...(` rather than a bare identifier, so
+# they match a *use* and not a *mention*. `\bWebSocket\b` matched the word
+# anywhere, including inside string literals -- and in these programs the string
+# literals are the resume text. A resume that said "WebSocket" was rejected as a
+# policy violation for describing its author's own experience.
+#
+# The identical `exec` pattern in DISALLOWED_PYTHON_PATTERNS is deliberately NOT
+# relaxed: `exec` is a Python builtin, so there the bare form is real.
 DISALLOWED_CODE_PATTERNS: list[tuple[str, str]] = [
-    (r"\bexec\s*\(", "exec( call"),
-    (r"\bexecFile\s*\(", "execFile( call"),
-    (r"\bspawn\s*\(", "spawn( call"),
-    (r"\bfork\s*\(", "fork( call"),
-    (r"\beval\s*\(", "eval( call"),
+    (r"(?<![.\w])exec\s*\(", "exec( call"),
+    (r"(?<![.\w])execFile\s*\(", "execFile( call"),
+    (r"(?<![.\w])spawn\s*\(", "spawn( call"),
+    (r"(?<![.\w])fork\s*\(", "fork( call"),
+    (r"(?:(?<![.\w])|\b(?:globalThis|global|window|self)\s*\.\s*)eval\s*\(", "eval( call"),
     (r"\bnew\s+Function\s*\(", "new Function( call"),
-    (r"\bimport\s*\(", "dynamic import( call"),
-    (r"\bfetch\s*\(", "fetch( call"),
-    (r"\bXMLHttpRequest\b", "XMLHttpRequest"),
-    (r"\bWebSocket\b", "WebSocket"),
+    (r"(?<![.\w])import\s*\(", "dynamic import( call"),
+    (r"(?:(?<![.\w])|\b(?:globalThis|global|window|self)\s*\.\s*)fetch\s*\(", "fetch( call"),
+    (r"\bnew\s+XMLHttpRequest\s*\(", "XMLHttpRequest construction"),
+    (r"\bnew\s+WebSocket\s*\(", "WebSocket construction"),
     (r"\bprocess\.exit\b", "process.exit"),
-    (r"https?://", "HTTP URL literal"),
 ]
 
 DISALLOWED_PYTHON_PATTERNS: list[tuple[str, str]] = [
@@ -132,7 +157,6 @@ DISALLOWED_PYTHON_PATTERNS: list[tuple[str, str]] = [
     (r"\bexec\s*\(", "exec( call"),
     (r"\b__import__\s*\(", "__import__( call"),
     (r"\bshutil\.rmtree\s*\(", "shutil.rmtree( call"),
-    (r"https?://", "HTTP URL literal"),
 ]
 
 SENSITIVE_ENV_VARS = frozenset({
@@ -314,6 +338,16 @@ def _success_result(
         "document_type": document_type,
         "renderer_type": renderer_type,
         "render_id": render_id,
+        # The absolute path to the created .docx, promoted to the top level as
+        # well as nested under "output".
+        #
+        # This is deliberate redundancy. A caller that cannot find the output
+        # fails *after* a successful render, so the failure looks like a
+        # renderer fault and consumes the caller's retry budget -- including the
+        # workflow contract's mandatory low->middle escalation -- on a defect
+        # that is purely a field-name mismatch. The nested block stays for
+        # existing callers; this is the one field a caller should have to know.
+        "output_path": output_path,
         "output": {
             "filename": filename,
             "path": output_path,
@@ -617,6 +651,12 @@ def validate_node_script_policy(files: list[Dict[str, str]]) -> list[Dict[str, s
                 errors.append(_render_error(
                     "SCRIPT_REJECTED_BY_POLICY",
                     f"Blocked import of '{module}' in {path}",
+                    detail=m.group(0).strip(),
+                ))
+            elif re.match(r"^https?://", module):
+                errors.append(_render_error(
+                    "SCRIPT_REJECTED_BY_POLICY",
+                    f"Remote module import from URL is not allowed: '{module}' in {path}",
                     detail=m.group(0).strip(),
                 ))
 
@@ -968,10 +1008,57 @@ def check_node_runtime(
     return True, node_version, errors
 
 
+#: Memoized python-runtime probe, keyed by (executable, runtime root).
+#:
+#: The answer cannot change within a process lifetime, and this check is called
+#: from `health_check` as well as from render. Without the cache, every
+#: health_check spawns two subprocesses to verify a runtime that most callers
+#: never use -- which is how a working server came to report
+#: `python: ready: false` because its *check* timed out, not because anything
+#: was missing.
+_PYTHON_RUNTIME_PROBE: Dict[Tuple[str, str], Tuple[bool, str, list[Dict[str, str]]]] = {}
+
+#: Generous because the failure it guards against is a cold native-extension
+#: import (python-docx pulls in lxml) on a machine with real-time antivirus.
+#: The probe runs once per process, so a large ceiling costs nothing.
+PYTHON_PROBE_TIMEOUT_SECONDS = 60
+
+
+def _probe(cmd: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
+    """Run a preflight probe without inheriting the server's stdio.
+
+    `stdin=DEVNULL` matters here specifically: this server runs as an MCP stdio
+    child, so its stdin is a live pipe owned by the client. Letting a probe
+    inherit that handle is the difference between this command taking 0.15s
+    from a shell and stalling under the server.
+    """
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        shell=False,
+        stdin=subprocess.DEVNULL,
+    )
+
+
 def check_python_runtime(
     settings: ServerSettings,
 ) -> Tuple[bool, str, list[Dict[str, str]]]:
-    """Return (ready, python_version, errors)."""
+    """Return (ready, python_version, errors). Memoized per process."""
+    cache_key = (settings.python_executable, settings.python_runtime_root)
+    cached = _PYTHON_RUNTIME_PROBE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    result = _check_python_runtime_uncached(settings)
+    _PYTHON_RUNTIME_PROBE[cache_key] = result
+    return result
+
+
+def _check_python_runtime_uncached(
+    settings: ServerSettings,
+) -> Tuple[bool, str, list[Dict[str, str]]]:
     errors: list[Dict[str, str]] = []
     py_exe = settings.python_executable
 
@@ -983,10 +1070,7 @@ def check_python_runtime(
         return False, "", errors
 
     try:
-        proc = subprocess.run(
-            [py_exe, "--version"],
-            capture_output=True, text=True, timeout=15, shell=False,
-        )
+        proc = _probe([py_exe, "--version"], PYTHON_PROBE_TIMEOUT_SECONDS)
         python_version = proc.stdout.strip() or proc.stderr.strip()
     except Exception as exc:
         errors.append(_render_error(
@@ -1005,9 +1089,9 @@ def check_python_runtime(
         return False, python_version, errors
 
     try:
-        proc = subprocess.run(
+        proc = _probe(
             [py_exe, "-c", "from docx import Document; print('python-docx OK')"],
-            capture_output=True, text=True, timeout=15, shell=False,
+            PYTHON_PROBE_TIMEOUT_SECONDS,
         )
         if proc.returncode != 0 or "python-docx OK" not in proc.stdout:
             stderr_tail = (proc.stderr or "").strip()[:500]
@@ -1017,6 +1101,21 @@ def check_python_runtime(
                 detail=f"Install with: pip install python-docx.  stderr: {stderr_tail}",
             ))
             return False, python_version, errors
+    except subprocess.TimeoutExpired:
+        # A probe that ran out of time proves nothing about the runtime, so do
+        # not report it as broken. python-docx may be perfectly importable and
+        # merely slow to load cold. Rendering will find out for real, and will
+        # say so with the actual import error rather than this one.
+        errors.append(_render_error(
+            "PYTHON_RUNTIME_UNVERIFIED",
+            f"python-docx check did not finish within "
+            f"{PYTHON_PROBE_TIMEOUT_SECONDS}s; the runtime was not verified.",
+            detail="This is not evidence the runtime is broken. A cold "
+                   "python-docx import (it loads lxml) can be slow under "
+                   "real-time antivirus. Python rendering will report the real "
+                   "error if the package is genuinely unusable.",
+        ))
+        return False, python_version, errors
     except Exception as exc:
         errors.append(_render_error(
             "PYTHON_RUNTIME_NOT_READY",

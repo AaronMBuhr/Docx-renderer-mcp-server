@@ -115,13 +115,14 @@ Policy is enforced by **static analysis before execution**, plus workspace place
 
 **Blocked Node imports:** `child_process`, `worker_threads`, `cluster`, `vm`, `http`, `https`, `net`, `tls`, `dns`, `dgram`, `os`
 **Blocked Python imports:** `subprocess`, `socket`, `requests`, `urllib`, `http`, `shutil`, `multiprocessing`, `ctypes`
-**Blocked patterns:** `eval(`, `exec(`, `spawn(`, `fork(`, `new Function(`, dynamic `import(`, `fetch(`, `XMLHttpRequest`, `WebSocket`, `process.exit`, and **any `http://` or `https://` literal**
-**Also rejected:** `require()` (ESM only), `node_modules` in any submitted file path
+**Blocked patterns (Node):** bare global calls `eval(`, `exec(`, `execFile(`, `spawn(`, `fork(`, `fetch(`, dynamic `import(` (plus `eval(`/`fetch(` reached via `globalThis.`, `global.`, `window.`, `self.`); `new Function(`, `new XMLHttpRequest(`, `new WebSocket(`; `process.exit`. Method calls such as `regex.exec(text)` are allowed.
+**Blocked patterns (Python):** `os.system(`, `os.popen(`, `os.exec*(`, `os.spawn*(`, `eval(`, `exec(`, `__import__(`, `shutil.rmtree(`
+**Also rejected:** `require()` (ESM only), static imports from an `http(s)://` URL, `node_modules` in any submitted file path
 **Environment:** only `OUTPUT_DOCX_PATH`, `DOCX_RENDER_WORKSPACE`, `DOCX_RENDER_METADATA_PATH` are readable; known secret-bearing variables are stripped from the child environment
 
 Two things to be clear-eyed about:
 
-- **The URL rule is a string match, not a semantic one.** A URL in a comment, or a hyperlink hardcoded into contact details, rejects the program even though nothing fetches anything. Visible links must arrive as plain text.
+- **The policy is a text match, not a semantic one.** It catches a well-behaved generator reaching for obvious APIs; it does not stop a program written to evade it (aliasing, `createRequire`, `process['env']`, and so on). URLs in string literals are allowed, so hyperlinks in contact details work.
 - **The security boundary is this server, not the runtime.** A docx document program executed by hand is ordinary Node or Python code with your full privileges. Running one directly is fine for debugging your own output; it is not a sandbox.
 
 `process.exit` is banned, which is why a program should let errors throw naturally rather than catching and exiting — the harness needs the real failure.
